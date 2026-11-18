@@ -15,6 +15,13 @@ import vtk
 
 import slicer
 from .BaseRequestHandler import BaseRequestHandler, BaseRequestLoggingFunction
+from .SessionManager import (
+    SCOPE_QUERY_PARAMETER,
+    SESSION_NODE_ATTRIBUTE,
+    SESSION_QUERY_PARAMETER,
+    isValidSessionId,
+    sessionManager,
+)
 
 # Import heavy Python packages lazily to make application startup faster
 from slicer.util import LazyImport
@@ -43,6 +50,9 @@ class SlicerRequestHandler(BaseRequestHandler):
         self.enableExec = enableExec
         self.sampleDataLogic = None  # used for progress reporting during download
         self.logMessage = logMessage or self.defaultLogMessage
+        # Node scope ("session" or "all") of the request that is being processed.
+        # Set by handleRequest from the `scope` query parameter.
+        self.requestScope = None
 
     def canHandleRequest(self, uri: bytes, **kwargs) -> float:
         """
@@ -67,10 +77,48 @@ class SlicerRequestHandler(BaseRequestHandler):
         parsedURL = urllib.parse.urlparse(uri)
         request = parsedURL.path
         request = request[len(b"/slicer") :]
-        if parsedURL.query != b"":
-            request += b"?" + parsedURL.query
+
+        # Session parameters are consumed here so that handlers that forward
+        # query parameters (e.g., file loading options) do not see them.
+        queryItems = urllib.parse.parse_qsl(parsedURL.query.decode(), keep_blank_values=True)
+        sessionId = None
+        scope = None
+        remainingQueryItems = []
+        for key, value in queryItems:
+            if key == SESSION_QUERY_PARAMETER:
+                sessionId = value.strip()
+            elif key == SCOPE_QUERY_PARAMETER:
+                scope = value.strip().lower()
+            else:
+                remainingQueryItems.append((key, value))
+        if remainingQueryItems:
+            request += b"?" + urllib.parse.urlencode(remainingQueryItems).encode()
         self.logMessage(" request is: %s" % request)
 
+        if request.find(b"/session") == 0:
+            responseBody, contentType = self.session(method, request)
+            return contentType, responseBody
+
+        session = None
+        if sessionId:
+            if not isValidSessionId(sessionId):
+                raise ValueError(f"Invalid session id '{sessionId}'")
+            session = sessionManager().getSession(sessionId, create=True)
+        if scope not in (None, "session", "all"):
+            raise ValueError(f"Invalid scope '{scope}': must be 'session' or 'all'")
+        if scope == "session" and session is None:
+            raise ValueError("scope=session requires the session query parameter")
+
+        previousScope = self.requestScope
+        self.requestScope = scope
+        try:
+            with sessionManager().activate(session):
+                return self.dispatchRequest(method, request, requestBody)
+        finally:
+            self.requestScope = previousScope
+
+    def dispatchRequest(self, method: str, request: bytes, requestBody: bytes) -> tuple[bytes, bytes]:
+        """Route a request (path relative to /slicer, with query) to its handler method."""
         responseBody = None
         contentType = b"text/plain"
         if self.enableExec and request.find(b"/exec") == 0:
@@ -135,11 +183,61 @@ class SlicerRequestHandler(BaseRequestHandler):
                 self.logMessage("need to supply source code to run")
                 return "", b"text/plain"
         self.logMessage("will run %s" % source)
-        exec("__execResult = {}", globals())
-        exec(source, globals())
-        result = json.dumps(eval("__execResult", globals())).encode()
+        session = sessionManager().activeSession
+        # Each session has its own namespace, requests without a session share the module globals
+        namespace = session.namespace if session is not None else globals()
+        namespace["__execResult"] = {}
+        exec(source, namespace)
+        result = json.dumps(namespace["__execResult"]).encode()
         self.logMessage("result: %s" % result)
         return result, b"application/json"
+
+    def session(self, method, request):
+        """Handle requests with path: /session
+
+        - GET /session: list sessions
+        - POST /session?id=...&name=...: create a session (both parameters are optional)
+        - GET /session/<id>: session information, including owned node IDs
+        - DELETE /session/<id>?removeNodes=true: close a session, by default removing the nodes it owns
+        """
+        p = urllib.parse.urlparse(request.decode())
+        q = urllib.parse.parse_qs(p.query)
+        pathParts = [part for part in p.path.split("/") if part]  # ["session", <id>]
+        manager = sessionManager()
+        sessionId = urllib.parse.unquote(pathParts[1]) if len(pathParts) > 1 else None
+
+        if sessionId is None:
+            if method == "GET":
+                return json.dumps({"sessions": manager.listSessions()}).encode(), b"application/json"
+            if method == "POST":
+                newSessionId = q["id"][0].strip() if "id" in q else None
+                name = q["name"][0].strip() if "name" in q else None
+                if newSessionId and manager.getSession(newSessionId, create=False):
+                    session = manager.getSession(newSessionId, create=False)
+                    if name:
+                        session.name = name
+                else:
+                    session = manager.createSession(newSessionId, name)
+                return json.dumps(session.info(includeNodes=True)).encode(), b"application/json"
+            raise RuntimeError(f"Unsupported method {method} for /session")
+
+        if method == "GET":
+            session = manager.getSession(sessionId, create=False)
+            if session is None:
+                raise RuntimeError(f"Session '{sessionId}' does not exist")
+            return json.dumps(session.info(includeNodes=True)).encode(), b"application/json"
+        if method == "DELETE":
+            removeNodes = q.get("removeNodes", ["true"])[0].strip().lower() not in ("false", "0", "no")
+            return json.dumps(manager.closeSession(sessionId, removeNodes)).encode(), b"application/json"
+        raise RuntimeError(f"Unsupported method {method} for /session/<id>")
+
+    def filterNodesByScope(self, nodes, defaultScope="all"):
+        """Keep only the nodes owned by the active session if the request scope is "session"."""
+        session = sessionManager().activeSession
+        scope = self.requestScope or defaultScope
+        if session is None or scope != "session":
+            return nodes
+        return [node for node in nodes if node.GetAttribute(SESSION_NODE_ATTRIBUTE) == session.id]
 
     def setupMRMLTracking(self):
         """
@@ -726,7 +824,7 @@ space origin: %%origin%%
         q = urllib.parse.parse_qs(p.query)
 
         if method == "GET":
-            nodes = self.getNodesFilteredByQuery(q)
+            nodes = self.filterNodesByScope(self.getNodesFilteredByQuery(q))
             if p.path == "/mrml" or p.path == "/mrml/names":
                 # return node names
                 return (json.dumps([node.GetName() for node in nodes]).encode()), b"application/json"
@@ -779,12 +877,17 @@ space origin: %%origin%%
             return json.dumps(response).encode(), b"application/json"
 
         elif method == "DELETE":
+            session = sessionManager().activeSession
             if "class" in q or "name" in q or "id" in q:
-                nodes = self.getNodesFilteredByQuery(q)
+                # Within a session only the session's own nodes are deleted, unless scope=all is requested
+                nodes = self.filterNodesByScope(self.getNodesFilteredByQuery(q), defaultScope="session")
                 if len(nodes) == 0:
                     raise RuntimeError("No nodes matched the filter criteria")
                 for node in nodes:
                     slicer.mrmlScene.RemoveNode(node)
+            elif session is not None:
+                # Never clear the whole scene on behalf of a session, other clients may be using it
+                session.removeNodes()
             else:
                 slicer.mrmlScene.Clear()
             return b'{"success": true}', b"application/json"
@@ -795,6 +898,8 @@ space origin: %%origin%%
         q = urllib.parse.parse_qs(p.query)
 
         if method == "DELETE":
+            if sessionManager().activeSession is not None:
+                raise RuntimeError("Exiting the application is not allowed from within a session")
             # exit the application 1 second after submitting the response
             qt.QTimer.singleShot(1000, slicer.util.exit)
             return b'{"success": true}', b"application/json"

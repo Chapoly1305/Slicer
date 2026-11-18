@@ -188,6 +188,59 @@ Other endpoints allow get/set of transforms and fiducials.
 
 ## Slicer REST API
 
+### Sessions
+
+Multiple clients (for example several AI agents connected through an MCP server) can use the same Slicer instance at the same time.
+To keep them from interfering with each other, each client can use its own session by adding the `session=<id>` query parameter to any Slicer endpoint.
+A session is created automatically the first time its ID is used. Session IDs are 1-64 characters long and contain only `A-Z`, `a-z`, `0-9`, `_`, `.`, `-`.
+
+Within a session:
+- `/exec` runs code in a Python namespace that belongs to the session, so variables defined by one client are not visible to (or overwritten by) other clients. The `__session__` variable gives access to the session object (e.g., `__session__.nodes()` returns the nodes owned by the session).
+- Nodes added to the scene while processing the session's requests are tagged with the `WebServer.SessionID` node attribute, which records which session owns them.
+- `scope=session` limits `GET /mrml` requests to nodes owned by the session (default: `scope=all`, all nodes are visible).
+- `DELETE /mrml` only removes nodes owned by the session (default: `scope=session`; use `scope=all` to remove matching nodes of any owner). Without filter parameters it removes all nodes of the session instead of clearing the scene.
+- `DELETE /system` (exit the application) is refused.
+
+All sessions share the same scene, layout, and views. Sessions prevent accidental interference but are not a security boundary.
+
+#### GET /session
+
+List sessions.
+
+Return:
+- 200 (application/json): JSON object, `sessions` property contains a list of session information objects (`id`, `name`, `created`, `lastAccess`, `requestCount`, `variables`, `nodeCount`).
+
+#### POST /session
+
+Create a session. If a session with the specified `id` already exists then it is returned (and renamed if `name` is specified).
+
+Parameters:
+- `id`: optional, session ID. A random ID is generated if not specified.
+- `name`: optional, human-readable name of the session.
+
+Return:
+- 200 (application/json): session information object, `nodeIDs` property contains IDs of nodes owned by the session.
+
+Example:
+
+    curl -X POST "localhost:2016/slicer/session?id=agent1&name=Segmentation%20agent"
+    curl -X POST "localhost:2016/slicer/exec?session=agent1" --data "a = 1"
+    curl -X POST "localhost:2016/slicer/exec?session=agent2" --data "__execResult = {'defined': 'a' in globals()}"
+
+#### GET /session/{id}
+
+Get information about a session, including the IDs of nodes it owns.
+
+#### DELETE /session/{id}
+
+Close a session and discard its Python namespace.
+
+Parameters:
+- `removeNodes`: `true` (default) removes the nodes owned by the session from the scene; `false` keeps them (they are no longer marked as owned).
+
+Return:
+- 200 (application/json): JSON object, `removedNodeIDs` property contains the IDs of removed nodes.
+
 ### Remote control (exec)
 
 #### GET /exec
