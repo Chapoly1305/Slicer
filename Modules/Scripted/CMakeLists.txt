@@ -20,6 +20,11 @@ if(Slicer_USE_NUMPY)
   list(APPEND modules
     Endoscopy
     )
+  if(APPLE)
+    list(APPEND modules
+      MetalSliceView
+      )
+  endif()
 endif()
 if(Slicer_USE_SCIPY)
   list(APPEND modules
